@@ -1,0 +1,624 @@
+
+<html>
+	<head>
+        <meta http-equiv='Content-Type' content='text/html; charset=UTF-8' />
+		<title>Harlowe To JSON</title>
+        <script type='text/javascript'>
+            /**
+* Twine To JSON
+*
+* Copyright (c) 2020 Jonathan Schoonhoven
+*
+* Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+* associated documentation files (the 'Software'), to deal in the Software without restriction,
+* including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so,
+* subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in all copies or substantial
+* portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+* LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
+const STORY_TAG_NAME = 'tw-storydata';
+const PASSAGE_TAG_NAME = 'tw-passagedata';
+const FORMAT_TWINE = 'twine';
+const FORMAT_HARLOWE_3 = 'harlowe-3';
+const VALID_FORMATS = [FORMAT_TWINE, FORMAT_HARLOWE_3];
+
+
+/**
+ * Convert Twine story to JSON.
+ */
+function twineToJSON(format) {
+    const storyElement = document.getElementsByTagName(STORY_TAG_NAME)[0];
+    const storyMeta = getElementAttributes(storyElement);
+    const result = {
+        uuid: storyMeta.ifid,
+        name: storyMeta.name,
+        creator: storyMeta.creator,
+        creatorVersion: storyMeta['creator-version'],
+        schemaName: storyMeta.format,
+        schemaVersion: storyMeta['format-version'],
+        createdAtMs: Date.now(),
+    };
+    validate(format);
+    const passageElements = Array.from(storyElement.getElementsByTagName(PASSAGE_TAG_NAME));
+    result.passages = passageElements.map((passageElement) => {
+        return processPassageElement(passageElement, format);
+    });
+    return result;
+}
+
+
+/**
+ * Validate story and inputs. Currently this only validates the format arg. TODO: make this more robust.
+ */
+function validate(format) {
+    const isValidFormat = VALID_FORMATS.some(validFormat => validFormat === format);
+    if (!isValidFormat) {
+        throw new Error('Format is not valid.');
+    }
+}
+
+
+/**
+ * Convert the HTML element for a story passage to JSON.
+ */
+function processPassageElement(passageElement, format) {
+    const passageMeta = getElementAttributes(passageElement);
+    const result = {
+        name: passageMeta.name,
+        tags: passageMeta.tags,
+        id: passageMeta.pid,
+    };
+    result.text = passageElement.innerText.trim();
+    Object.assign(result, processPassageText(result.text, format));
+    result.cleanText = sanitizeText(result.text, result.links, result.hooks, format);
+    return result;
+}
+
+
+function processPassageText(passageText, format) {
+    const result = { links: [] };
+    if (format === FORMAT_HARLOWE_3) {
+        result.hooks = [];
+    }
+    let currentIndex = 0;
+    while (currentIndex < passageText.length) {
+        const maybeLink = extractLinksAtIndex(passageText, currentIndex);
+        if (maybeLink) {
+            result.links.push(maybeLink);
+            currentIndex += maybeLink.original.length;
+        }
+        if (format !== FORMAT_HARLOWE_3) {
+            currentIndex += 1;
+            continue;
+        }
+        const maybeLeftHook = extractLeftHooksAtIndex(passageText, currentIndex);
+        if (maybeLeftHook) {
+            result.hooks.push(maybeLeftHook);
+            currentIndex += maybeLeftHook.original.length;
+        }
+        currentIndex += 1;
+        const maybeHook = extractHooksAtIndex(passageText, currentIndex);
+        if (maybeHook) {
+            result.hooks.push(maybeHook);
+            currentIndex += maybeHook.original.length;
+        }
+    }
+    return result;
+}
+
+
+function extractLinksAtIndex(passageText, currentIndex) {
+    const currentChar = passageText[currentIndex];
+    const nextChar = passageText[currentIndex + 1];
+    if (currentChar === '[' && nextChar === '[') {
+        const link = getSubstringBetweenBrackets(passageText, currentIndex + 1);
+        const leftSplit = link.split('<-', 2);
+        const rightSplit = link.split('->', 2);
+        const original = passageText.substring(currentIndex, currentIndex + link.length + 4);
+        if (leftSplit.length === 2) {
+            return { linkText: leftSplit[1].trim(), passageName: leftSplit[0].trim(), original: original };
+        }
+        else if (rightSplit.length === 2) {
+            return { linkText: rightSplit[0].trim(), passageName: rightSplit[1].trim(), original: original };
+        }
+        else {
+            return { linkText: link.trim(), passageName: link.trim(), original: original };
+        }
+    }
+}
+
+
+function extractLeftHooksAtIndex(passageText, currentIndex) {
+    const regexAlphaNum = /[a-z0-9]+/i;
+    const currentChar = passageText[currentIndex];
+    if (currentChar === '|') {
+        const maybeHookName = getSubstringBetweenBrackets(passageText, currentIndex, '|', '>');
+        if (maybeHookName.match(regexAlphaNum)) {
+            const hookStartIndex = currentIndex + maybeHookName.length + 2; // advance to next char after ">"
+            const hookStartChar = passageText[hookStartIndex];
+            if (hookStartChar === '[') {
+                const hookText = getSubstringBetweenBrackets(passageText, hookStartIndex);
+                const hookEndIndex = hookStartIndex + hookText.length + 2;
+                const original = passageText.substring(currentIndex, hookEndIndex);
+                return { hookName: maybeHookName, hookText: hookText, original: original };
+            }
+        }
+    }
+}
+
+
+function extractHooksAtIndex(passageText, currentIndex) {
+    const regexAlphaNum = /[a-z0-9]+/i;
+    const currentChar = passageText[currentIndex];
+    const nextChar = passageText[currentIndex + 1];
+    const prevChar = currentIndex && passageText[currentIndex - 1];
+    if (currentChar === '[' && nextChar !== '[' && prevChar !== '[') {
+        const hookText = getSubstringBetweenBrackets(passageText, currentIndex);
+        const hookEndIndex = currentIndex + hookText.length + 2;
+        const hookEndChar = passageText[hookEndIndex];
+        if (hookEndChar === '<') {
+            const maybeHookName = getSubstringBetweenBrackets(passageText, hookEndIndex, '<', '|');
+            if (maybeHookName.match(regexAlphaNum)) {
+                const original = passageText.substring(currentIndex, hookEndIndex + maybeHookName.length + 2);
+                return { hookName: maybeHookName, hookText: hookText, original: original };
+            }
+        }
+        const original = passageText.substring(currentIndex, hookText.length + 2);
+        return { hookName: undefined, hookText: hookText, original: original };
+    }
+}
+
+
+function sanitizeText(passageText, links, hooks, format) {
+    links.forEach((link) => {
+        passageText = passageText.replace(link.original, '');
+    });
+    if (format === FORMAT_HARLOWE_3) {
+        hooks.forEach((hook) => {
+            passageText = passageText.replace(hook.original, '');
+        });
+    }
+    return passageText.trim();
+}
+
+
+/**
+ * Convert an HTML element to an object of attribute values.
+ */
+function getElementAttributes(element) {
+    const result = {};
+    const attributes = Array.from(element.attributes);
+    attributes.forEach((attribute) => {
+        result[attribute.name] = attribute.value;
+    });
+    return result;
+}
+
+
+/**
+ * True if string starts with the given substring.
+ */
+function stringStartsWith(string, startswith) {
+    return string.trim().substring(0, startswith.length) === startswith;
+}
+
+
+function getSubstringBetweenBrackets(string, startIndex, openBracket, closeBracket) {
+    openBracket = openBracket || '[';
+    closeBracket = closeBracket || ']';
+    const bracketStack = [];
+    let currentIndex = startIndex || 0;
+    let substring = '';
+    if (string[currentIndex] !== openBracket) {
+        throw new Error('startIndex of getSubstringBetweenBrackets must correspond to an open bracket');
+    }
+    while (currentIndex < string.length) {
+        const currentChar = string[currentIndex];
+        // pull top bracket from stack if we hit a close bracket
+        if (currentChar === closeBracket) {
+            bracketStack.pop();
+        }
+        // build substring so long as stack is populated
+        if (bracketStack.length) {
+            substring += currentChar;
+        }
+        // add open brackets to the top of the stack
+        if (currentChar === openBracket) {
+            bracketStack.push(currentChar);
+        }
+        // return if stack is empty and substring is set
+        if (!bracketStack.length) {
+            return substring;
+        }
+        currentIndex += 1;
+    }
+    return substring;
+}
+
+        </script>
+	</head>
+	<body>
+        <pre id='content'></pre>
+        <div id='storyData' style='display: none;'><tw-storydata name="Rare Art Museum Heist" startnode="1" creator="Twine" creator-version="2.3.14" ifid="9BD60891-83E8-4CCF-9ED1-A98D881D79CF" zoom="1" format="Harlowe 3 to JSON" format-version="0.0.6" options="" hidden><style role="stylesheet" id="twine-user-stylesheet" type="text/twine-css"></style><script role="script" id="twine-user-script" type="text/twine-javascript"></script><tw-passagedata pid="1" name="South of Museum" tags="" position="700,13" size="100,100">You are getting ready to steal some expensive art from the Green Moss Museum. You patiently waited several meters away from the museum. Your mission is to steal one treasure from each of the exhibits and steal enough to pay back your debt to the mafia.
+
+[[Continue-&gt;Entrance of Museum]]</tw-passagedata><tw-passagedata pid="2" name="Entrance of Museum" tags="" position="698,129" size="100,100">You sneak up to the Entrance of the Museum. The sign reads &quot;Green Moss Museum&quot; and there is a guard standing outside of the entrance, what will you do?
+
+[[ATTACK-&gt;Ending 1]]
+[[DISTRACTION-&gt;Inside of Museum]]
+[[WAIT-&gt;Inside of Museum]]</tw-passagedata><tw-passagedata pid="3" name="Ending 1" tags="" position="528,23" size="100,100">You run up to the guard in an attempt to take him out, but you are too far away from him to begin with and they pull out their gun and shoot you several times. You fall to the floor and bleed out. GAME OVER!
+
+[[TRY AGAIN-&gt;Entrance of Museum]]</tw-passagedata><tw-passagedata pid="4" name="Inside of Museum" tags="" position="690,259" size="100,100">You are inside of the museum, you glance all around to see beautiful art pieces and sculptures on display. There are three hallways in front of you, which hallway do you choose?
+
+[[SCIENCE HALL-&gt;Science Hall]]
+[[EGYPTIAN HALL-&gt;Egyptian Hall]]
+[[RENAISSANCE HALL-&gt;Renaissance Hall]]</tw-passagedata><tw-passagedata pid="5" name="Science Hall" tags="" position="503,266" size="100,100">You walk into the Science Hall and find incredible pieces of technology displayed. Things from giant robots to the first model of airplanes can be seen. But before you can take a step you notice the whole section of the museum is covered with lasers and high tech security robots. You spot the security room across the hall. What do you do?
+
+[[PARKOUR ON DISPLAYS-&gt;Ending 2]]
+[[DISGUISE AS ROBOT-&gt;Science Security Room]]</tw-passagedata><tw-passagedata pid="6" name="Egyptian Hall" tags="" position="674,417" size="100,100">You walk into the Egyptian Hall and find incredible pieces of art displayed. Things from sculptures to the mummy&#39;s sarcophagus can be seen. You take a few steps in and all of a sudden sand starts to appear. There is a sandstorm starting in here. What do you do?
+
+[[FIND THE SOURCE-&gt;Pharaoh&#39;s Room]]
+[[LEAVE-&gt;Ending 3]]</tw-passagedata><tw-passagedata pid="7" name="Renaissance Hall" tags="" position="982,260" size="100,100">You some steps into the Renaisance Hall and find cool medieval art displayed. Things from suits of armor to giant catapults can be seen around the room. You walk around amazed by all the cool contraptions when the wax figure of a King comes to life. He requests your help, what do you do?
+
+[[HELP THE KING-&gt;King&#39;s Request]]
+[[DON&#39;T HELP-&gt;King&#39;s Punishment]]</tw-passagedata><tw-passagedata pid="8" name="Ending 2" tags="" position="347,24" size="100,100">You make a running start and you leap onto the model airplane and it starts tipping over the one side, you find yourself slipping and holding on for dear life. You eventually lose grip and fall onto the lasers alerting the robot guards to surround you and take you out. GAME OVER!
+
+[[TRY AGAIN-&gt;Science Hall]]</tw-passagedata><tw-passagedata pid="9" name="Science Security Room" tags="" position="355,265" size="100,100">You take out the nearest robot guard and disguised yourself as one of them. You walk towards the security room. Waving and saying wassup to the other robot guards trying to blend in. This works and you make it to the front door. You enter to see one guard sitting in front of all the screens he was asleep all this time. You disable the cameras and walk back out, you see three treasures that peak your interest. Which one will you choose the take?
+
+[[EXPERIMENTAL ORBITAL BEAM RAYGUN-&gt;Experiment Raygun]]
+[[SKULL OF NEIL ARMSTRONG-&gt;Skull of Neil]]
+[[BOXING GLOVES THAT ALLOW YOU TO PUNCH GHOSTS-&gt;Ghost Punching Gloves]]</tw-passagedata><tw-passagedata pid="10" name="Experiment Raygun" tags="" position="132,247" size="100,100">You pick up the Experimental Orbital Beam Raygun. You attempt to fire it but nothing happened. Must be out of batteries. You put the raygun into your backpack and left the Science Hall
+
+[[CONTINUE-&gt;(S)Main Hall]]</tw-passagedata><tw-passagedata pid="11" name="Skull of Neil" tags="" position="349,394" size="100,100">You pick up Neil Armstrong&#39;s Skull, I guess you like old people&#39;s bones for some reason, still it will fetch a hefty price. You put the skull into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(S)Main Hall]]</tw-passagedata><tw-passagedata pid="12" name="Ghost Punching Gloves" tags="" position="492,392" size="100,100">You pick up the boxing gloves that can punch ghosts. You put them on and swung around in the air. Nothing happened because you don&#39;t believe in ghost therefore no ghosts revealed themselves to you. (in reality you just punched out 4 ghosts around you.) You put the gloves into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(S)Main Hall]]</tw-passagedata><tw-passagedata pid="13" name="(S)Main Hall" tags="" position="467,556" size="100,100">You have two more halls left to explore.
+
+[[EGYPTIAN HALL-&gt;(S)Egyptian Hall]]
+[[RENAISANCE HALL-&gt;(S)Renaissance Hall]] </tw-passagedata><tw-passagedata pid="14" name="Pharaoh&#39;s Room" tags="" position="687,577" size="100,100">You put on your mask to keep the sand out of your mouth determined to find the source of this sandstorm. You push against the winds knowing that the closer you get to the source the more winds resist you. Before you know it you made to it the source, the pharaoh&#39;s room.&#39;&#39;WHO DARES DISTURB MY SLUMBER!!!&#39;&#39; What do you do?
+
+[[TELL HIM YOU&#39;RE HIS MOTHER-&gt;Mother]]
+[[BEAT HIM UP-&gt;WWE SMACKDOWN]]</tw-passagedata><tw-passagedata pid="15" name="Ending 3" tags="" position="865,17" size="100,100">You decided to choose life so you turned around and headed for the exit. Only to have the storm get even stronger. You start to get lost but keep walking forward for what it seems minutes have passed and you haven&#39;t made any progress. Eventually your lungs fill with sand and you die. GAMEOVER!
+
+[[TRY AGAIN-&gt;Egyptian Hall]]</tw-passagedata><tw-passagedata pid="16" name="Mother" tags="" position="811,730" size="100,100">&quot;I&#39;m your mother and you need to go back to sleep and stop this tantrum young man, I&#39;m not going to tell you again&quot; you say to the mummy. &quot;OK MOTHER&quot; says the pharoah and lays back down into his coffin stopping the sandstorm.
+
+[[CONTINUE-&gt;Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="17" name="WWE SMACKDOWN" tags="" position="583,730" size="100,100">&#39;&#39;Stop this sandstorm!!&#39;&#39; You yelled, throwing as many punches as you can at the mummy. The mummy&#39;s body flailing around as each fist connects to it. The evil red eyes on the mummy slowly disappeared and his body falls back into the coffin, stopping the sandstorm.
+
+[[Continue-&gt;Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="18" name="Pharaoh&#39;s Treasure" tags="" position="694,870" size="100,100">When the sandstorm calms down you find yourself inside the Pharoah&#39;s Treasure Room. You find three treasure that catch your interest. What do you choose?
+
+[[24K SOLID GOLD ANKH WITH DIAMONDS-&gt;Ankh]]
+[[CURSED FINGER OF THE PHARAOH-&gt;Cursed Finger]]
+[[MAGIC STAFF THAT CAN MOVE SAND-&gt;Magic Staff]]</tw-passagedata><tw-passagedata pid="19" name="Ankh" tags="" position="528,965" size="100,100">You picked up the 24K solid gold diamond encrusted Ankh. INFINITE POWER FLOWS WITHIN YOU. &quot;This will fetch a good price.&quot; you say, and puts it in your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(E)Main Hall]]</tw-passagedata><tw-passagedata pid="20" name="Cursed Finger" tags="" position="696,1013" size="100,100">You pick up the Cursed Finger. An evil aura can be felt coming from the finger. It speaks to you in a small voice for you to consume the finger. Offering you a 1 in a million chance to gain godlike powers. You put the cursed finger into your backpack. You leave the Egyptian Hall.
+
+[[Continue-&gt;(E)Main Hall]]</tw-passagedata><tw-passagedata pid="21" name="Magic Staff" tags="" position="879,969" size="100,100">You pick up the Magic Staff. You wave it around and sand moves to wherever you point it. You use the Magic Staff to build a little sand castle. You put the staff into your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(E)Main Hall]]</tw-passagedata><tw-passagedata pid="22" name="(E)Main Hall" tags="" position="685,1221" size="100,100">You have two more halls left to explore.
+
+[[SCIENCE HALL-&gt;(E)Science Hall]] 
+[[RENAISANCE HALL-&gt;(E)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="23" name="(S)Egyptian Hall" tags="" position="128,378" size="100,100">You walk into the Egyptian Hall and find incredible pieces of art displayed. Things from sculptures to the mummy&#39;s sarcophagus can be seen. You take a few steps in and all of a sudden sand starts to appear. There is a sandstorm starting in here. What do you do?
+
+[[FIND THE SOURCE-&gt;(S)Pharaoh&#39;s Room]]
+[[LEAVE-&gt;(S)Ending 3]]</tw-passagedata><tw-passagedata pid="24" name="(S)Renaissance Hall" tags="" position="373,1008" size="100,100">You some steps into the Renaisance Hall and find cool medieval art displayed. Things from suits of armor to giant catapults can be seen around the room. You walk around amazed by all the cool contraptions when the wax figure of a King comes to life. He requests your help, what do you do?
+
+[[HELP THE KING-&gt;(S)King&#39;s Request]]
+[[DON&#39;T HELP-&gt;(S)King&#39;s Punishment]]</tw-passagedata><tw-passagedata pid="25" name="(S)Pharaoh&#39;s Room" tags="" position="134,518" size="100,100">You put on your mask to keep the sand out of your mouth determined to find the source of this sandstorm. You push against the winds knowing that the closer you get to the source the more winds resist you. Before you know it you made to it the source, the pharaoh&#39;s room.&#39;&#39;WHO DARES DISTURB MY SLUMBER!!!&#39;&#39; What do you do?
+
+[[TELL HIM YOU&#39;RE HIS MOTHER-&gt;(S)Mother]]
+[[BEAT HIM UP-&gt;(S)WWE SMACKDOWN]]</tw-passagedata><tw-passagedata pid="26" name="(S)Ending 3" tags="" position="11,339" size="100,100">You decided to choose life so you turned around and headed for the exit. Only to have the storm get even stronger. You start to get lost but keep walking forward for what it seems minutes have passed and you haven&#39;t made any progress. Eventually your lungs fill with sand and you die. GAMEOVER!
+
+[[TRY AGAIN-&gt;(S)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="27" name="(S)Mother" tags="" position="15,512" size="100,100">&quot;I&#39;m your mother and you need to go back to sleep and stop this tantrum young man, I&#39;m not going to tell you again&quot; you say to the mummy. &quot;OK MOTHER&quot; says the pharoah and lays back down into his coffin stopping the sandstorm.
+
+[[CONTINUE-&gt;(S)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="28" name="(S)WWE SMACKDOWN" tags="" position="259,513" size="100,100">&#39;&#39;Stop this sandstorm!!&#39;&#39; You yelled, throwing as many punches as you can at the mummy. The mummy&#39;s body flailing around as each fist connects to it. The evil red eyes on the mummy slowly disappeared and his body falls back into the coffin, stopping the sandstorm.
+
+[[Continue-&gt;(S)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="29" name="(S)Pharaoh&#39;s Treasure" tags="" position="130,648" size="100,100">When the sandstorm calms down you find yourself inside the Pharoah&#39;s Treasure Room. You find three treasure that catch your interest. What do you choose?
+
+[[24K SOLID GOLD ANKH WITH DIAMONDS-&gt;(S)Ankh]]
+[[CURSED FINGER OF THE PHARAOH-&gt;(S)Cursed Finger]]
+[[MAGIC STAFF THAT CAN MOVE SAND-&gt;(S)Magic Staff]]</tw-passagedata><tw-passagedata pid="30" name="(S)Ankh" tags="" position="0,798" size="100,100">You picked up the 24K solid gold diamond encrusted Ankh. INFINITE POWER FLOWS WITHIN YOU. &quot;This will fetch a good price.&quot; you say, and puts it in your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(SE)Main Hall]]</tw-passagedata><tw-passagedata pid="31" name="(S)Cursed Finger" tags="" position="130,798" size="100,100">You pick up the Cursed Finger. An evil aura can be felt coming from the finger. It speaks to you in a small voice for you to consume the finger. Offering you a 1 in a million chance to gain godlike powers. You put the cursed finger into your backpack. You leave the Egyptian Hall.
+
+[[Continue-&gt;(SE)Main Hall]]</tw-passagedata><tw-passagedata pid="32" name="(S)Magic Staff" tags="" position="280,798" size="100,100">You pick up the Magic Staff. You wave it around and sand moves to wherever you point it. You use the Magic Staff to build a little sand castle. You put the staff into your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(SE)Main Hall]]</tw-passagedata><tw-passagedata pid="33" name="(SE)Main Hall" tags="" position="178,995" size="100,100">There is one hall left to explore.
+
+[[RENAISSANCE HALL-&gt;(SE)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="34" name="(E)Science Hall" tags="" position="601,1344" size="100,100">You walk into the Science Hall and find incredible pieces of technology displayed. Things from giant robots to the first model of airplanes can be seen. But before you can take a step you notice the whole section of the museum is covered with lasers and high tech security robots. You spot the security room across the hall. What do you do?
+
+[[PARKOUR ON DISPLAYS-&gt;(E)Ending 2]]
+[[DISGUISE AS ROBOT-&gt;(E)Science Security Room]]</tw-passagedata><tw-passagedata pid="35" name="(E)Renaissance Hall" tags="" position="805,1371" size="100,100">You some steps into the Renaisance Hall and find cool medieval art displayed. Things from suits of armor to giant catapults can be seen around the room. You walk around amazed by all the cool contraptions when the wax figure of a King comes to life. He requests your help, what do you do?
+
+[[HELP THE KING-&gt;(E)King&#39;s Request]]
+[[DON&#39;T HELP-&gt;(E)King&#39;s Punishment]]</tw-passagedata><tw-passagedata pid="36" name="(E)Ending 2" tags="" position="567,1125" size="100,100">You make a running start and you leap onto the model airplane and it starts tipping over the one side, you find yourself slipping and holding on for dear life. You eventually lose grip and fall onto the lasers alerting the robot guards to surround you and take you out. GAME OVER!
+
+[[TRY AGAIN-&gt;(E)Science Hall]]</tw-passagedata><tw-passagedata pid="37" name="(E)Science Security Room" tags="" position="623,1502" size="100,100">You take out the nearest robot guard and disguised yourself as one of them. You walk towards the security room. Waving and saying wassup to the other robot guards trying to blend in. This works and you make it to the front door. You enter to see one guard sitting in front of all the screens he was asleep all this time. You disable the cameras and walk back out, you see three treasures that peak your interest. Which one will you choose the take?
+
+[[EXPERIMENTAL ORBITAL BEAM RAYGUN-&gt;(E)Experiment Raygun]]
+[[SKULL OF NEIL ARMSTRONG-&gt;(E)Skull of Neil]]
+[[BOXING GLOVES THAT ALLOW YOU TO PUNCH GHOSTS-&gt;(E)Ghost Punching Gloves]]</tw-passagedata><tw-passagedata pid="38" name="(E)Experiment Raygun" tags="" position="497,1714" size="100,100">You pick up the Experimental Orbital Beam Raygun. You attempt to fire it but nothing happened. Must be out of batteries. You put the raygun into your backpack and left the Science Hall
+
+[[CONTINUE-&gt;(ES)Main Hall]]</tw-passagedata><tw-passagedata pid="39" name="(E)Skull of Neil" tags="" position="623,1652" size="100,100">You pick up Neil Armstrong&#39;s Skull, I guess you like old people&#39;s bones for some reason, still it will fetch a hefty price. You put the skull into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(ES)Main Hall]]</tw-passagedata><tw-passagedata pid="40" name="(E)Ghost Punching Gloves" tags="" position="773,1652" size="100,100">You pick up Neil Armstrong&#39;s Skull, I guess you like old people&#39;s bones for some reason, still it will fetch a hefty price. You put the skull into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(ES)Main Hall]]</tw-passagedata><tw-passagedata pid="41" name="(ES)Main Hall" tags="" position="750,1838" size="100,100">There is one hall left to explore.
+
+[[RENAISSANCE HALL-&gt;(ES)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="42" name="King&#39;s Request" tags="" position="837,408" size="100,100">You decided to aid the king in anyway you can. He walks with you telling you all about the history of his Kingdom and how he has fallen ill with an uncurable disease. He wants you to marry his daughter the princess because he needs a someone to rule the kingdom and continue his bloodline.
+
+[[MARRY THE PRINCESS-&gt;Marriage]]
+[[DECLINE HIS OFFER-&gt;Ending 4]]</tw-passagedata><tw-passagedata pid="43" name="King&#39;s Punishment" tags="" position="1053,385" size="100,100">You tell him that you aren&#39;t interested in helping him and that you&#39;re here because you have your own thing. The King gets angry and with a snap of his finger the suits of armor come to life and apprehend you. They take you downstairs and toss you into a cell. The King tells you to stay down here until you decide to change your mind about marrying his daughter or rot in here forever.
+
+[[MARRY HIS DAUGHTER-&gt;Marriage]]
+[[LIVE LIFE AS A PRISONER-&gt;Ending 5]]</tw-passagedata><tw-passagedata pid="44" name="Marriage" tags="" position="956,509" size="100,100">You decided to marry the princess. They celebrate the wedding with a huge feast. So much delicious food and drinks all around the table. There is music playing and lots of the King&#39;s subjects dancing all around.
+
+[[TAKE A DRINK-&gt;Ending 6]]
+[[TRY TO FIND THE TREASURE ROOM-&gt;King&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="45" name="Ending 4" tags="" position="908,129" size="100,100">The King is upset that he told you his super sad sob story and you refused to help him even though you said you would. Suddenly his men surround you and fills your body up with arrows. GAME OVER!
+
+[[TRY AGAIN-&gt;Renaissance Hall]]</tw-passagedata><tw-passagedata pid="46" name="Ending 5" tags="" position="1200,258" size="100,100">You decide to live your life as a prisoner. You enjoy being hung from your hands above your head 12 hours of the day, doing manual labor, and eating slop with grey water everyday for the rest of your life. GAME OVER!
+
+[[TRY AGAIN-&gt;Renaissance Hall]]</tw-passagedata><tw-passagedata pid="47" name="Ending 6" tags="" position="1153,493" size="100,100">You grab a drink &quot;Maybe this won&#39;t be so bad&quot; you say to yourself. You drink until you pass out and party with the King and his people. You have so much fun partying with people from the renaissance. In the morning you get thrown into a suit and next thing you know you are standing in front of the princess. You get married and as soon as you become the new king, the old king&#39;s rival burst in out of nowhere with his army and attack. GAME OVER!
+
+[[TRY AGAIN-&gt;Marriage]]</tw-passagedata><tw-passagedata pid="48" name="King&#39;s Treasure" tags="" position="1018,654" size="100,100">You decide to sneak away and look for the King&#39;s Treasure room. While everyone is getting too drunk you come across the the room. You take a peak inside and there was treasure and gold everywhere. You grin with delight. You find three treasures that you are interested in.
+
+[[THE KING&#39;S SWORD-&gt;King&#39;s Sword]]
+[[CROWN WITH GIGANTIC GEM-&gt;Crown]]
+[[CAPE WITH PORTAL FOR INFINITE STORAGE-&gt;Cape]]</tw-passagedata><tw-passagedata pid="49" name="King&#39;s Sword" tags="" position="990,871" size="100,100">You pick up the King&#39;s Sword. You swing it around and accidentally launch an energy projectile at the bust of the King. You put the King&#39;s Sword into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(R)Main Hall]]</tw-passagedata><tw-passagedata pid="50" name="Crown" tags="" position="1113,799" size="100,100">You pick up the Crown with a gigantic gem. It is a lot heavier on your head than you thought, you head gives in and you fall over. You put the Crown into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(R)Main Hall]]</tw-passagedata><tw-passagedata pid="51" name="Cape" tags="" position="1275,698" size="100,100">You pick up the Cape. You put it on and reach inside and feel around for something. You pull out a chalice half full with wine. Looks like the King has more problems more than his illness. You put the Cape into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(R)Main Hall]]</tw-passagedata><tw-passagedata pid="52" name="(R)Main Hall" tags="" position="1122,987" size="100,100">You have two more halls left to explore.
+
+[[SCIENCE HALL-&gt;(R)Science Hall]] 
+[[EGYPTIAN HALL-&gt;(R)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="53" name="(R)Science Hall" tags="" position="1047,1137" size="100,100">You walk into the Science Hall and find incredible pieces of technology displayed. Things from giant robots to the first model of airplanes can be seen. But before you can take a step you notice the whole section of the museum is covered with lasers and high tech security robots. You spot the security room across the hall. What do you do?
+
+[[PARKOUR ON DISPLAYS-&gt;(R)Ending 2]]
+[[DISGUISE AS ROBOT-&gt;(R)Science Security Room]]</tw-passagedata><tw-passagedata pid="54" name="(R)Egyptian Hall" tags="" position="1267,1137" size="100,100">You walk into the Egyptian Hall and find incredible pieces of art displayed. Things from sculptures to the mummy&#39;s sarcophagus can be seen. You take a few steps in and all of a sudden sand starts to appear. There is a sandstorm starting in here. What do you do?
+
+[[FIND THE SOURCE-&gt;(R)Pharaoh&#39;s Room]]
+[[LEAVE-&gt;(R)Ending 3]]</tw-passagedata><tw-passagedata pid="55" name="(SE)Renaissance Hall" tags="" position="167,1145" size="100,100">You some steps into the Renaisance Hall and find cool medieval art displayed. Things from suits of armor to giant catapults can be seen around the room. You walk around amazed by all the cool contraptions when the wax figure of a King comes to life. He requests your help, what do you do?
+
+[[HELP THE KING-&gt;(SE)King&#39;s Request]]
+[[DON&#39;T HELP-&gt;(SE)King&#39;s Punishment]]</tw-passagedata><tw-passagedata pid="56" name="(SE)King&#39;s Request" tags="" position="32,1285" size="100,100">You decided to aid the king in anyway you can. He walks with you telling you all about the history of his Kingdom and how he has fallen ill with an uncurable disease. He wants you to marry his daughter the princess because he needs a someone to rule the kingdom and continue his bloodline.
+
+[[MARRY THE PRINCESS-&gt;(SE)Marriage]]
+[[DECLINE HIS OFFER-&gt;(SE)Ending 4]]</tw-passagedata><tw-passagedata pid="57" name="(SE)King&#39;s Punishment" tags="" position="277,1111" size="100,100">You tell him that you aren&#39;t interested in helping him and that you&#39;re here because you have your own thing. The King gets angry and with a snap of his finger the suits of armor come to life and apprehend you. They take you downstairs and toss you into a cell. The King tells you to stay down here until you decide to change your mind about marrying his daughter or rot in here forever.
+
+[[MARRY HIS DAUGHTER-&gt;(SE)Marriage]]
+[[LIVE LIFE AS A PRISONER-&gt;(SE)Ending 5]]</tw-passagedata><tw-passagedata pid="58" name="(SE)Marriage" tags="" position="206,1388" size="100,100">You decided to marry the princess. They celebrate the wedding with a huge feast. So much delicious food and drinks all around the table. There is music playing and lots of the King&#39;s subjects dancing all around.
+
+[[TAKE A DRINK-&gt;(SE)Ending 6]]
+[[TRY TO FIND THE TREASURE ROOM-&gt;(SE)King&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="59" name="(SE)Ending 4" tags="" position="23,1071" size="100,100">The King is upset that he told you his super sad sob story and you refused to help him even though you said you would. Suddenly his men surround you and fills your body up with arrows. GAME OVER!
+
+[[TRY AGAIN-&gt;(SE)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="60" name="(SE)Ending 5" tags="" position="208,1258" size="100,100">You decide to live your life as a prisoner. You enjoy being hung from your hands above your head 12 hours of the day, doing manual labor, and eating slop with grey water everyday for the rest of your life. GAME OVER!
+
+[[TRY AGAIN-&gt;(SE)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="61" name="(SE)Ending 6" tags="" position="32,1433" size="100,100">You grab a drink &quot;Maybe this won&#39;t be so bad&quot; you say to yourself. You drink until you pass out and party with the King and his people. You have so much fun partying with people from the renaissance. In the morning you get thrown into a suit and next thing you know you are standing in front of the princess. You get married and as soon as you become the new king, the old king&#39;s rival burst in out of nowhere with his army and attack. GAME OVER!
+
+[[TRY AGAIN-&gt;(SE)Marriage]]</tw-passagedata><tw-passagedata pid="62" name="(SE)King&#39;s Treasure" tags="" position="189,1530" size="100,100">You decide to sneak away and look for the King&#39;s Treasure room. While everyone is getting too drunk you come across the the room. You take a peak inside and there was treasure and gold everywhere. You grin with delight. You find three treasures that you are interested in.
+
+[[THE KING&#39;S SWORD-&gt;(SE)King&#39;s Sword]]
+[[CROWN WITH GIGANTIC GEM-&gt;(SE)Crown]]
+[[CAPE WITH PORTAL FOR INFINITE STORAGE-&gt;(SE)Cape]]</tw-passagedata><tw-passagedata pid="63" name="(SE)King&#39;s Sword" tags="" position="28,1604" size="100,100">You pick up the King&#39;s Sword. You swing it around and accidentally launch an energy projectile at the bust of the King. You put the King&#39;s Sword into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(SER)Main Hall]]</tw-passagedata><tw-passagedata pid="64" name="(SE)Crown" tags="" position="172,1654" size="100,100">You pick up the Crown with a gigantic gem. It is a lot heavier on your head than you thought, you head gives in and you fall over. You put the Crown into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(SER)Main Hall]]</tw-passagedata><tw-passagedata pid="65" name="(SE)Cape" tags="" position="295,1645" size="100,100">You pick up the Cape. You put it on and reach inside and feel around for something. You pull out a chalice half full with wine. Looks like the King has more problems more than his illness. You put the Cape into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(SER)Main Hall]]</tw-passagedata><tw-passagedata pid="66" name="(SER)Main Hall" tags="" position="87,3109" size="100,100">You have finally taken one treasure from each hall now time to find out how much money you&#39;ve made.
+
+[[TOTAL-&gt;TOTAL MONEY]]</tw-passagedata><tw-passagedata pid="67" name="(S)King&#39;s Request" tags="" position="324,1261" size="100,100">You decided to aid the king in anyway you can. He walks with you telling you all about the history of his Kingdom and how he has fallen ill with an uncurable disease. He wants you to marry his daughter the princess because he needs a someone to rule the kingdom and continue his bloodline.
+
+[[MARRY THE PRINCESS-&gt;(S)Marriage]]
+[[DECLINE HIS OFFER-&gt;(S)Ending 4]]</tw-passagedata><tw-passagedata pid="68" name="(S)King&#39;s Punishment" tags="" position="429,1147" size="100,100">You tell him that you aren&#39;t interested in helping him and that you&#39;re here because you have your own thing. The King gets angry and with a snap of his finger the suits of armor come to life and apprehend you. They take you downstairs and toss you into a cell. The King tells you to stay down here until you decide to change your mind about marrying his daughter or rot in here forever.
+
+[[MARRY HIS DAUGHTER-&gt;(S)Marriage]]
+[[LIVE LIFE AS A PRISONER-&gt;(S)Ending 5]]</tw-passagedata><tw-passagedata pid="69" name="(S)Marriage" tags="" position="319,1777" size="100,100">You decided to marry the princess. They celebrate the wedding with a huge feast. So much delicious food and drinks all around the table. There is music playing and lots of the King&#39;s subjects dancing all around.
+
+[[TAKE A DRINK-&gt;(S)Ending 6]]
+[[TRY TO FIND THE TREASURE ROOM-&gt;(S)King&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="70" name="(S)Ending 6" tags="" position="257,1931" size="100,100">You grab a drink &quot;Maybe this won&#39;t be so bad&quot; you say to yourself. You drink until you pass out and party with the King and his people. You have so much fun partying with people from the renaissance. In the morning you get thrown into a suit and next thing you know you are standing in front of the princess. You get married and as soon as you become the new king, the old king&#39;s rival burst in out of nowhere with his army and attack. GAME OVER!
+
+[[TRY AGAIN-&gt;(S)Marriage]]</tw-passagedata><tw-passagedata pid="71" name="(S)King&#39;s Treasure" tags="" position="474,1880" size="100,100">You decide to sneak away and look for the King&#39;s Treasure room. While everyone is getting too drunk you come across the the room. You take a peak inside and there was treasure and gold everywhere. You grin with delight. You find three treasures that you are interested in.
+
+[[THE KING&#39;S SWORD-&gt;(S)King&#39;s Sword]]
+[[CROWN WITH GIGANTIC GEM-&gt;(S)Crown]]
+[[CAPE WITH PORTAL FOR INFINITE STORAGE-&gt;(S)Cape]]</tw-passagedata><tw-passagedata pid="72" name="(S)King&#39;s Sword" tags="" position="324,2051" size="100,100">You pick up the King&#39;s Sword. You swing it around and accidentally launch an energy projectile at the bust of the King. You put the King&#39;s Sword into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(SR)Main Hall]]</tw-passagedata><tw-passagedata pid="73" name="(S)Crown" tags="" position="474,2030" size="100,100">You pick up the Crown with a gigantic gem. It is a lot heavier on your head than you thought, you head gives in and you fall over. You put the Crown into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(SR)Main Hall]]</tw-passagedata><tw-passagedata pid="74" name="(S)Cape" tags="" position="624,2030" size="100,100">You pick up the Cape. You put it on and reach inside and feel around for something. You pull out a chalice half full with wine. Looks like the King has more problems more than his illness. You put the Cape into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(SR)Main Hall]]</tw-passagedata><tw-passagedata pid="75" name="(SR)Main Hall" tags="" position="466,2196" size="100,100">There is one hall left to explore.
+
+[[EGYPTIAN HALL-&gt;(SR)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="76" name="(SR)Egyptian Hall" tags="" position="458,2335" size="100,100">You walk into the Egyptian Hall and find incredible pieces of art displayed. Things from sculptures to the mummy&#39;s sarcophagus can be seen. You take a few steps in and all of a sudden sand starts to appear. There is a sandstorm starting in here. What do you do?
+
+[[FIND THE SOURCE-&gt;(SR)Pharaoh&#39;s Room]]
+[[LEAVE-&gt;(SR)Ending 3]]</tw-passagedata><tw-passagedata pid="77" name="(S)Ending 4" tags="" position="405,1484" size="100,100">The King is upset that he told you his super sad sob story and you refused to help him even though you said you would. Suddenly his men surround you and fills your body up with arrows. GAME OVER!
+
+[[TRY AGAIN-&gt;(S)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="78" name="(S)Ending 5" tags="" position="464,1333" size="100,100">You decide to live your life as a prisoner. You enjoy being hung from your hands above your head 12 hours of the day, doing manual labor, and eating slop with grey water everyday for the rest of your life. GAME OVER!
+
+[[TRY AGAIN-&gt;(S)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="79" name="(SR)Pharaoh&#39;s Room" tags="" position="383,2485" size="100,100">You put on your mask to keep the sand out of your mouth determined to find the source of this sandstorm. You push against the winds knowing that the closer you get to the source the more winds resist you. Before you know it you made to it the source, the pharaoh&#39;s room.&#39;&#39;WHO DARES DISTURB MY SLUMBER!!!&#39;&#39; What do you do?
+
+[[TELL HIM YOU&#39;RE HIS MOTHER-&gt;(SR)Mother]]
+[[BEAT HIM UP-&gt;(SR)WWE SMACKDOWN]]</tw-passagedata><tw-passagedata pid="80" name="(SR)Ending 3" tags="" position="539,2484" size="100,100">You decided to choose life so you turned around and headed for the exit. Only to have the storm get even stronger. You start to get lost but keep walking forward for what it seems minutes have passed and you haven&#39;t made any progress. Eventually your lungs fill with sand and you die. GAMEOVER!
+
+[[TRY AGAIN-&gt;(SR)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="81" name="(SR)Mother" tags="" position="308,2635" size="100,100">&quot;I&#39;m your mother and you need to go back to sleep and stop this tantrum young man, I&#39;m not going to tell you again&quot; you say to the mummy. &quot;OK MOTHER&quot; says the pharoah and lays back down into his coffin stopping the sandstorm.
+
+[[CONTINUE-&gt;(SR)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="82" name="(SR)WWE SMACKDOWN" tags="" position="458,2635" size="100,100">&#39;&#39;Stop this sandstorm!!&#39;&#39; You yelled, throwing as many punches as you can at the mummy. The mummy&#39;s body flailing around as each fist connects to it. The evil red eyes on the mummy slowly disappeared and his body falls back into the coffin, stopping the sandstorm.
+
+[[Continue-&gt;(SR)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="83" name="(SR)Pharaoh&#39;s Treasure" tags="" position="384,2792" size="100,100">When the sandstorm calms down you find yourself inside the Pharoah&#39;s Treasure Room. You find three treasure that catch your interest. What do you choose?
+
+[[24K SOLID GOLD ANKH WITH DIAMONDS-&gt;(SR)Ankh]]
+[[CURSED FINGER OF THE PHARAOH-&gt;(SR)Cursed Finger]]
+[[MAGIC STAFF THAT CAN MOVE SAND-&gt;(SR)Magic Staff]]</tw-passagedata><tw-passagedata pid="84" name="(SR)Ankh" tags="" position="234,2942" size="100,100">You picked up the 24K solid gold diamond encrusted Ankh. INFINITE POWER FLOWS WITHIN YOU. &quot;This will fetch a good price.&quot; you say, and puts it in your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(SRE)Main Hall]]</tw-passagedata><tw-passagedata pid="85" name="(SR)Cursed Finger" tags="" position="384,2942" size="100,100">You pick up the Cursed Finger. An evil aura can be felt coming from the finger. It speaks to you in a small voice for you to consume the finger. Offering you a 1 in a million chance to gain godlike powers. You put the cursed finger into your backpack. You leave the Egyptian Hall.
+
+[[Continue-&gt;(SRE)Main Hall]]</tw-passagedata><tw-passagedata pid="86" name="(SR)Magic Staff" tags="" position="534,2942" size="100,100">You pick up the Magic Staff. You wave it around and sand moves to wherever you point it. You use the Magic Staff to build a little sand castle. You put the staff into your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(SRE)Main Hall]]</tw-passagedata><tw-passagedata pid="87" name="(SRE)Main Hall" tags="" position="383,3101" size="100,100">You have finally taken one treasure from each hall now time to find out how much money you&#39;ve made.
+
+[[TOTAL-&gt;TOTAL MONEY]]</tw-passagedata><tw-passagedata pid="88" name="(ES)Renaissance Hall" tags="" position="780,2017" size="100,100">You some steps into the Renaisance Hall and find cool medieval art displayed. Things from suits of armor to giant catapults can be seen around the room. You walk around amazed by all the cool contraptions when the wax figure of a King comes to life. He requests your help, what do you do?
+
+[[HELP THE KING-&gt;(ES)King&#39;s Request]]
+[[DON&#39;T HELP-&gt;(ES)King&#39;s Punishment]]</tw-passagedata><tw-passagedata pid="89" name="(ES)King&#39;s Request" tags="" position="705,2167" size="100,100">You decided to aid the king in anyway you can. He walks with you telling you all about the history of his Kingdom and how he has fallen ill with an uncurable disease. He wants you to marry his daughter the princess because he needs a someone to rule the kingdom and continue his bloodline.
+
+[[MARRY THE PRINCESS-&gt;(ES)Marriage]]
+[[DECLINE HIS OFFER-&gt;(ES)Ending 4]]</tw-passagedata><tw-passagedata pid="90" name="(ES)King&#39;s Punishment" tags="" position="855,2167" size="100,100">You tell him that you aren&#39;t interested in helping him and that you&#39;re here because you have your own thing. The King gets angry and with a snap of his finger the suits of armor come to life and apprehend you. They take you downstairs and toss you into a cell. The King tells you to stay down here until you decide to change your mind about marrying his daughter or rot in here forever.
+
+[[MARRY HIS DAUGHTER-&gt;(ES)Marriage]]
+[[LIVE LIFE AS A PRISONER-&gt;(ES)Ending 5]]</tw-passagedata><tw-passagedata pid="91" name="(E)King&#39;s Request" tags="" position="906,1519" size="100,100">You decided to aid the king in anyway you can. He walks with you telling you all about the history of his Kingdom and how he has fallen ill with an uncurable disease. He wants you to marry his daughter the princess because he needs a someone to rule the kingdom and continue his bloodline.
+
+[[MARRY THE PRINCESS-&gt;(E)Marriage]]
+[[DECLINE HIS OFFER-&gt;(E)Ending 4]]</tw-passagedata><tw-passagedata pid="92" name="(E)King&#39;s Punishment" tags="" position="1088,1498" size="100,100">You tell him that you aren&#39;t interested in helping him and that you&#39;re here because you have your own thing. The King gets angry and with a snap of his finger the suits of armor come to life and apprehend you. They take you downstairs and toss you into a cell. The King tells you to stay down here until you decide to change your mind about marrying his daughter or rot in here forever.
+
+[[MARRY HIS DAUGHTER-&gt;(E)Marriage]]
+[[LIVE LIFE AS A PRISONER-&gt;(E)Ending 5]]</tw-passagedata><tw-passagedata pid="93" name="(ES)Marriage" tags="" position="893,2443" size="100,100">You decided to marry the princess. They celebrate the wedding with a huge feast. So much delicious food and drinks all around the table. There is music playing and lots of the King&#39;s subjects dancing all around.
+
+[[TAKE A DRINK-&gt;(ES)Ending 6]]
+[[TRY TO FIND THE TREASURE ROOM-&gt;(ES)King&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="94" name="(ES)Ending 4" tags="" position="791,2307" size="100,100">The King is upset that he told you his super sad sob story and you refused to help him even though you said you would. Suddenly his men surround you and fills your body up with arrows. GAME OVER!
+
+[[TRY AGAIN-&gt;(ES)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="95" name="(E)Marriage" tags="" position="893,1669" size="100,100">You decided to marry the princess. They celebrate the wedding with a huge feast. So much delicious food and drinks all around the table. There is music playing and lots of the King&#39;s subjects dancing all around.
+
+[[TAKE A DRINK-&gt;(E)Ending 6]]
+[[TRY TO FIND THE TREASURE ROOM-&gt;(E)King&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="96" name="(E)Ending 4" tags="" position="1019,1653" size="100,100">The King is upset that he told you his super sad sob story and you refused to help him even though you said you would. Suddenly his men surround you and fills your body up with arrows. GAME OVER!
+
+[[TRY AGAIN-&gt;(E)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="97" name="(E)Ending 5" tags="" position="1133,1648" size="100,100">You decide to live your life as a prisoner. You enjoy being hung from your hands above your head 12 hours of the day, doing manual labor, and eating slop with grey water everyday for the rest of your life. GAME OVER!
+
+[[TRY AGAIN-&gt;(E)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="98" name="(ES)Ending 5" tags="" position="1006,2300" size="100,100">You decide to live your life as a prisoner. You enjoy being hung from your hands above your head 12 hours of the day, doing manual labor, and eating slop with grey water everyday for the rest of your life. GAME OVER!
+
+[[TRY AGAIN-&gt;(ES)Renaissance Hall]]</tw-passagedata><tw-passagedata pid="99" name="(E)Ending 6" tags="" position="870,1819" size="100,100">You grab a drink &quot;Maybe this won&#39;t be so bad&quot; you say to yourself. You drink until you pass out and party with the King and his people. You have so much fun partying with people from the renaissance. In the morning you get thrown into a suit and next thing you know you are standing in front of the princess. You get married and as soon as you become the new king, the old king&#39;s rival burst in out of nowhere with his army and attack. GAME OVER!
+
+[[TRY AGAIN-&gt;(E)Marriage]]</tw-passagedata><tw-passagedata pid="100" name="(E)King&#39;s Treasure" tags="" position="990,1819" size="100,100">You decide to sneak away and look for the King&#39;s Treasure room. While everyone is getting too drunk you come across the the room. You take a peak inside and there was treasure and gold everywhere. You grin with delight. You find three treasures that you are interested in.
+
+[[THE KING&#39;S SWORD-&gt;(E)King&#39;s Sword]]
+[[CROWN WITH GIGANTIC GEM-&gt;(E)Crown]]
+[[CAPE WITH PORTAL FOR INFINITE STORAGE-&gt;(E)Cape]]</tw-passagedata><tw-passagedata pid="101" name="(ES)Ending 6" tags="" position="818,2593" size="100,100">You grab a drink &quot;Maybe this won&#39;t be so bad&quot; you say to yourself. You drink until you pass out and party with the King and his people. You have so much fun partying with people from the renaissance. In the morning you get thrown into a suit and next thing you know you are standing in front of the princess. You get married and as soon as you become the new king, the old king&#39;s rival burst in out of nowhere with his army and attack. GAME OVER!
+
+[[TRY AGAIN-&gt;(ES)Marriage]]</tw-passagedata><tw-passagedata pid="102" name="(ES)King&#39;s Treasure" tags="" position="968,2593" size="100,100">You decide to sneak away and look for the King&#39;s Treasure room. While everyone is getting too drunk you come across the the room. You take a peak inside and there was treasure and gold everywhere. You grin with delight. You find three treasures that you are interested in.
+
+[[THE KING&#39;S SWORD-&gt;(ES)King&#39;s Sword]]
+[[CROWN WITH GIGANTIC GEM-&gt;(ES)Crown]]
+[[CAPE WITH PORTAL FOR INFINITE STORAGE-&gt;(ES)Cape]]</tw-passagedata><tw-passagedata pid="103" name="(ES)King&#39;s Sword" tags="" position="818,2743" size="100,100">You pick up the King&#39;s Sword. You swing it around and accidentally launch an energy projectile at the bust of the King. You put the King&#39;s Sword into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(ESR)Main Hall]]</tw-passagedata><tw-passagedata pid="104" name="(ES)Crown" tags="" position="968,2743" size="100,100">You pick up the Crown with a gigantic gem. It is a lot heavier on your head than you thought, you head gives in and you fall over. You put the Crown into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(ESR)Main Hall]]</tw-passagedata><tw-passagedata pid="105" name="(ES)Cape" tags="" position="1118,2743" size="100,100">You pick up the Cape. You put it on and reach inside and feel around for something. You pull out a chalice half full with wine. Looks like the King has more problems more than his illness. You put the Cape into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(ESR)Main Hall]]</tw-passagedata><tw-passagedata pid="106" name="(E)King&#39;s Sword" tags="" position="908,1964" size="100,100">You pick up the King&#39;s Sword. You swing it around and accidentally launch an energy projectile at the bust of the King. You put the King&#39;s Sword into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(ER)Main Hall]]</tw-passagedata><tw-passagedata pid="107" name="(E)Crown" tags="" position="1020,1969" size="100,100">You pick up the Crown with a gigantic gem. It is a lot heavier on your head than you thought, you head gives in and you fall over. You put the Crown into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(ER)Main Hall]]</tw-passagedata><tw-passagedata pid="108" name="(E)Cape" tags="" position="1140,1969" size="100,100">You pick up the Cape. You put it on and reach inside and feel around for something. You pull out a chalice half full with wine. Looks like the King has more problems more than his illness. You put the Cape into your backpack. You leave the Renaissance Hall.
+
+[[CONTINUE-&gt;(ER)Main Hall]]</tw-passagedata><tw-passagedata pid="109" name="(ER)Main Hall" tags="" position="1146,2147" size="100,100">There is one hall left to explore.
+
+[[SCIENCE HALL-&gt;(ER)Science Hall]]</tw-passagedata><tw-passagedata pid="110" name="(ESR)Main Hall" tags="" position="721,3090" size="100,100">You have finally taken one treasure from each hall now time to find out how much money you&#39;ve made.
+
+[[TOTAL-&gt;TOTAL MONEY]]</tw-passagedata><tw-passagedata pid="111" name="(ER)Science Hall" tags="" position="1194,2295" size="100,100">You walk into the Science Hall and find incredible pieces of technology displayed. Things from giant robots to the first model of airplanes can be seen. But before you can take a step you notice the whole section of the museum is covered with lasers and high tech security robots. You spot the security room across the hall. What do you do?
+
+[[PARKOUR ON DISPLAYS-&gt;(ER)Ending 2]]
+[[DISGUISE AS ROBOT-&gt;(ER)Science Security Room]]</tw-passagedata><tw-passagedata pid="112" name="(ER)Ending 2" tags="" position="1119,2445" size="100,100">You make a running start and you leap onto the model airplane and it starts tipping over the one side, you find yourself slipping and holding on for dear life. You eventually lose grip and fall onto the lasers alerting the robot guards to surround you and take you out. GAME OVER!
+
+[[TRY AGAIN-&gt;(ER)Science Hall]]</tw-passagedata><tw-passagedata pid="113" name="(ER)Science Security Room" tags="" position="1269,2445" size="100,100">You take out the nearest robot guard and disguised yourself as one of them. You walk towards the security room. Waving and saying wassup to the other robot guards trying to blend in. This works and you make it to the front door. You enter to see one guard sitting in front of all the screens he was asleep all this time. You disable the cameras and walk back out, you see three treasures that peak your interest. Which one will you choose the take?
+
+[[EXPERIMENTAL ORBITAL BEAM RAYGUN-&gt;(ER)Experiment Raygun]]
+[[SKULL OF NEIL ARMSTRONG-&gt;(ER)Skull of Neil]]
+[[BOXING GLOVES THAT ALLOW YOU TO PUNCH GHOSTS-&gt;(ER)Ghost Punching Gloves]]</tw-passagedata><tw-passagedata pid="114" name="(R)Ending 2" tags="" position="972,1287" size="100,100">You make a running start and you leap onto the model airplane and it starts tipping over the one side, you find yourself slipping and holding on for dear life. You eventually lose grip and fall onto the lasers alerting the robot guards to surround you and take you out. GAME OVER!
+
+[[TRY AGAIN-&gt;(R)Science Hall]]</tw-passagedata><tw-passagedata pid="115" name="(R)Science Security Room" tags="" position="1122,1287" size="100,100">You take out the nearest robot guard and disguised yourself as one of them. You walk towards the security room. Waving and saying wassup to the other robot guards trying to blend in. This works and you make it to the front door. You enter to see one guard sitting in front of all the screens he was asleep all this time. You disable the cameras and walk back out, you see three treasures that peak your interest. Which one will you choose the take?
+
+[[EXPERIMENTAL ORBITAL BEAM RAYGUN-&gt;(R)Experiment Raygun]]
+[[SKULL OF NEIL ARMSTRONG-&gt;(R)Skull of Neil]]
+[[BOXING GLOVES THAT ALLOW YOU TO PUNCH GHOSTS-&gt;(R)Ghost Punching Gloves]]</tw-passagedata><tw-passagedata pid="116" name="(ER)Experiment Raygun" tags="" position="1119,2595" size="100,100">You pick up the Experimental Orbital Beam Raygun. You attempt to fire it but nothing happened. Must be out of batteries. You put the raygun into your backpack and left the Science Hall
+
+[[CONTINUE-&gt;(ERS)Main Hall]]</tw-passagedata><tw-passagedata pid="117" name="(ER)Skull of Neil" tags="" position="1263,2606" size="100,100">You pick up Neil Armstrong&#39;s Skull, I guess you like old people&#39;s bones for some reason, still it will fetch a hefty price. You put the skull into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(ERS)Main Hall]]</tw-passagedata><tw-passagedata pid="118" name="(ER)Ghost Punching Gloves" tags="" position="1419,2595" size="100,100">You pick up the boxing gloves that can punch ghosts. You put them on and swung around in the air. Nothing happened because you don&#39;t believe in ghost therefore no ghosts revealed themselves to you. (in reality you just punched out 4 ghosts around you.) You put the gloves into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(ERS)Main Hall]]</tw-passagedata><tw-passagedata pid="119" name="(R)Experiment Raygun" tags="" position="1215,1480" size="100,100">You pick up the Experimental Orbital Beam Raygun. You attempt to fire it but nothing happened. Must be out of batteries. You put the raygun into your backpack and left the Science Hall
+
+[[CONTINUE-&gt;(RS)Main Hall]]</tw-passagedata><tw-passagedata pid="120" name="(R)Skull of Neil" tags="" position="1365,1466" size="100,100">You pick up Neil Armstrong&#39;s Skull, I guess you like old people&#39;s bones for some reason, still it will fetch a hefty price. You put the skull into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(RS)Main Hall]]</tw-passagedata><tw-passagedata pid="121" name="(R)Ghost Punching Gloves" tags="" position="1516,1484" size="100,100">You pick up the boxing gloves that can punch ghosts. You put them on and swung around in the air. Nothing happened because you don&#39;t believe in ghost therefore no ghosts revealed themselves to you. (in reality you just punched out 4 ghosts around you.) You put the gloves into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(RS)Main Hall]]</tw-passagedata><tw-passagedata pid="122" name="(RS)Main Hall" tags="" position="1365,1642" size="100,100">There is one hall left to explore.
+
+[[EGYPTIAN HALL-&gt;(RS)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="123" name="(ERS)Main Hall" tags="" position="1273,3091" size="100,100">You have finally taken one treasure from each hall now time to find out how much money you&#39;ve made.
+
+[[TOTAL-&gt;TOTAL MONEY]]</tw-passagedata><tw-passagedata pid="124" name="(RS)Egyptian Hall" tags="" position="1365,1792" size="100,100">You walk into the Egyptian Hall and find incredible pieces of art displayed. Things from sculptures to the mummy&#39;s sarcophagus can be seen. You take a few steps in and all of a sudden sand starts to appear. There is a sandstorm starting in here. What do you do?
+
+[[FIND THE SOURCE-&gt;(RS)Pharaoh&#39;s Room]]
+[[LEAVE-&gt;(RS)Ending 3]]</tw-passagedata><tw-passagedata pid="125" name="(R)Pharaoh&#39;s Room" tags="" position="1478,1312" size="100,100">You put on your mask to keep the sand out of your mouth determined to find the source of this sandstorm. You push against the winds knowing that the closer you get to the source the more winds resist you. Before you know it you made to it the source, the pharaoh&#39;s room.&#39;&#39;WHO DARES DISTURB MY SLUMBER!!!&#39;&#39; What do you do?
+
+[[TELL HIM YOU&#39;RE HIS MOTHER-&gt;(R)Mother]]
+[[BEAT HIM UP-&gt;(R)WWE SMACKDOWN]]</tw-passagedata><tw-passagedata pid="126" name="(R)Ending 3" tags="" position="1322,1245" size="100,100">You decided to choose life so you turned around and headed for the exit. Only to have the storm get even stronger. You start to get lost but keep walking forward for what it seems minutes have passed and you haven&#39;t made any progress. Eventually your lungs fill with sand and you die. GAMEOVER!
+
+[[TRY AGAIN-&gt;(R)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="127" name="(RS)Pharaoh&#39;s Room" tags="" position="1371,1940" size="100,100">You put on your mask to keep the sand out of your mouth determined to find the source of this sandstorm. You push against the winds knowing that the closer you get to the source the more winds resist you. Before you know it you made to it the source, the pharaoh&#39;s room.&#39;&#39;WHO DARES DISTURB MY SLUMBER!!!&#39;&#39; What do you do?
+
+[[TELL HIM YOU&#39;RE HIS MOTHER-&gt;(RS)Mother]]
+[[BEAT HIM UP-&gt;(RS)WWE SMACKDOWN]]</tw-passagedata><tw-passagedata pid="128" name="(RS)Ending 3" tags="" position="1169,1788" size="100,100">You decided to choose life so you turned around and headed for the exit. Only to have the storm get even stronger. You start to get lost but keep walking forward for what it seems minutes have passed and you haven&#39;t made any progress. Eventually your lungs fill with sand and you die. GAMEOVER!
+
+[[TRY AGAIN-&gt;(RS)Egyptian Hall]]</tw-passagedata><tw-passagedata pid="129" name="(R)Mother" tags="" position="1776,1482" size="100,100">&quot;I&#39;m your mother and you need to go back to sleep and stop this tantrum young man, I&#39;m not going to tell you again&quot; you say to the mummy. &quot;OK MOTHER&quot; says the pharoah and lays back down into his coffin stopping the sandstorm.
+
+[[CONTINUE-&gt;(R)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="130" name="(R)WWE SMACKDOWN" tags="" position="1633,1486" size="100,100">&#39;&#39;Stop this sandstorm!!&#39;&#39; You yelled, throwing as many punches as you can at the mummy. The mummy&#39;s body flailing around as each fist connects to it. The evil red eyes on the mummy slowly disappeared and his body falls back into the coffin, stopping the sandstorm.
+
+[[Continue-&gt;(R)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="131" name="(RS)Mother" tags="" position="1296,2090" size="100,100">&quot;I&#39;m your mother and you need to go back to sleep and stop this tantrum young man, I&#39;m not going to tell you again&quot; you say to the mummy. &quot;OK MOTHER&quot; says the pharoah and lays back down into his coffin stopping the sandstorm.
+
+[[CONTINUE-&gt;(RS)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="132" name="(RS)WWE SMACKDOWN" tags="" position="1446,2090" size="100,100">&#39;&#39;Stop this sandstorm!!&#39;&#39; You yelled, throwing as many punches as you can at the mummy. The mummy&#39;s body flailing around as each fist connects to it. The evil red eyes on the mummy slowly disappeared and his body falls back into the coffin, stopping the sandstorm.
+
+[[Continue-&gt;(RS)Pharaoh&#39;s Treasure]]</tw-passagedata><tw-passagedata pid="133" name="(R)Pharaoh&#39;s Treasure" tags="" position="1679,1649" size="100,100">When the sandstorm calms down you find yourself inside the Pharoah&#39;s Treasure Room. You find three treasure that catch your interest. What do you choose?
+
+[[24K SOLID GOLD ANKH WITH DIAMONDS-&gt;(R)Ankh]]
+[[CURSED FINGER OF THE PHARAOH-&gt;(R)Cursed Finger]]
+[[MAGIC STAFF THAT CAN MOVE SAND-&gt;(R)Magic Staff]]</tw-passagedata><tw-passagedata pid="134" name="(RS)Pharaoh&#39;s Treasure" tags="" position="1460,2241" size="100,100">When the sandstorm calms down you find yourself inside the Pharoah&#39;s Treasure Room. You find three treasure that catch your interest. What do you choose?
+
+[[24K SOLID GOLD ANKH WITH DIAMONDS-&gt;(RS)Ankh]]
+[[CURSED FINGER OF THE PHARAOH-&gt;(RS)Cursed Finger]]
+[[MAGIC STAFF THAT CAN MOVE SAND-&gt;(RS)Magic Staff]]</tw-passagedata><tw-passagedata pid="135" name="(R)Ankh" tags="" position="1529,1799" size="100,100">You picked up the 24K solid gold diamond encrusted Ankh. INFINITE POWER FLOWS WITHIN YOU. &quot;This will fetch a good price.&quot; you say, and puts it in your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(RE)Main Hall]]</tw-passagedata><tw-passagedata pid="136" name="(R)Cursed Finger" tags="" position="1679,1799" size="100,100">You pick up the Cursed Finger. An evil aura can be felt coming from the finger. It speaks to you in a small voice for you to consume the finger. Offering you a 1 in a million chance to gain godlike powers. You put the cursed finger into your backpack. You leave the Egyptian Hall.
+
+[[Continue-&gt;(RE)Main Hall]]</tw-passagedata><tw-passagedata pid="137" name="(R)Magic Staff" tags="" position="1829,1799" size="100,100">You pick up the Magic Staff. You wave it around and sand moves to wherever you point it. You use the Magic Staff to build a little sand castle. You put the staff into your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(RE)Main Hall]]</tw-passagedata><tw-passagedata pid="138" name="(RS)Ankh" tags="" position="1399,2388" size="100,100">You picked up the 24K solid gold diamond encrusted Ankh. INFINITE POWER FLOWS WITHIN YOU. &quot;This will fetch a good price.&quot; you say, and puts it in your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(RSE)Main Hall]]</tw-passagedata><tw-passagedata pid="139" name="(RS)Cursed Finger" tags="" position="1524,2379" size="100,100">You pick up the Cursed Finger. An evil aura can be felt coming from the finger. It speaks to you in a small voice for you to consume the finger. Offering you a 1 in a million chance to gain godlike powers. You put the cursed finger into your backpack. You leave the Egyptian Hall.
+
+[[Continue-&gt;(RSE)Main Hall]]</tw-passagedata><tw-passagedata pid="140" name="(RS)Magic Staff" tags="" position="1668,2381" size="100,100">You pick up the Magic Staff. You wave it around and sand moves to wherever you point it. You use the Magic Staff to build a little sand castle. You put the staff into your backpack. You leave the Egyptian Hall.
+
+[[CONTINUE-&gt;(RSE)Main Hall]]</tw-passagedata><tw-passagedata pid="141" name="(RE)Main Hall" tags="" position="1684,1972" size="100,100">There is one hall left to explore.
+
+[[SCIENCE HALL-&gt;(RE)Science Hall]]</tw-passagedata><tw-passagedata pid="142" name="(RSE)Main Hall" tags="" position="1569,3095" size="100,100">You have finally taken one treasure from each hall now time to find out how much money you&#39;ve made.
+
+[[TOTAL-&gt;TOTAL MONEY]]</tw-passagedata><tw-passagedata pid="143" name="(RE)Science Hall" tags="" position="1866,2002" size="100,100">You walk into the Science Hall and find incredible pieces of technology displayed. Things from giant robots to the first model of airplanes can be seen. But before you can take a step you notice the whole section of the museum is covered with lasers and high tech security robots. You spot the security room across the hall. What do you do?
+
+[[PARKOUR ON DISPLAYS-&gt;(RE)Ending 2]]
+[[DISGUISE AS ROBOT-&gt;(RE)Science Security Room]]</tw-passagedata><tw-passagedata pid="144" name="(RE)Ending 2" tags="" position="1866,2231" size="100,100">You make a running start and you leap onto the model airplane and it starts tipping over the one side, you find yourself slipping and holding on for dear life. You eventually lose grip and fall onto the lasers alerting the robot guards to surround you and take you out. GAME OVER!
+
+[[TRY AGAIN-&gt;(RE)Science Hall]]</tw-passagedata><tw-passagedata pid="145" name="(RE)Science Security Room" tags="" position="2016,2231" size="100,100">You take out the nearest robot guard and disguised yourself as one of them. You walk towards the security room. Waving and saying wassup to the other robot guards trying to blend in. This works and you make it to the front door. You enter to see one guard sitting in front of all the screens he was asleep all this time. You disable the cameras and walk back out, you see three treasures that peak your interest. Which one will you choose the take?
+
+[[EXPERIMENTAL ORBITAL BEAM RAYGUN-&gt;(RE)Experiment Raygun]]
+[[SKULL OF NEIL ARMSTRONG-&gt;(RE)Skull of Neil]]
+[[BOXING GLOVES THAT ALLOW YOU TO PUNCH GHOSTS-&gt;(RE)Ghost Punching Gloves]]</tw-passagedata><tw-passagedata pid="146" name="(RE)Experiment Raygun" tags="" position="1866,2381" size="100,100">You pick up the Experimental Orbital Beam Raygun. You attempt to fire it but nothing happened. Must be out of batteries. You put the raygun into your backpack and left the Science Hall
+
+[[CONTINUE-&gt;(RES)Main Hall]]</tw-passagedata><tw-passagedata pid="147" name="(RE)Skull of Neil" tags="" position="2016,2381" size="100,100">You pick up Neil Armstrong&#39;s Skull, I guess you like old people&#39;s bones for some reason, still it will fetch a hefty price. You put the skull into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(RES)Main Hall]]</tw-passagedata><tw-passagedata pid="148" name="(RE)Ghost Punching Gloves" tags="" position="2166,2381" size="100,100">You pick up the boxing gloves that can punch ghosts. You put them on and swung around in the air. Nothing happened because you don&#39;t believe in ghost therefore no ghosts revealed themselves to you. (in reality you just punched out 4 ghosts around you.) You put the gloves into your backpack and left the Science Hall.
+
+[[CONTINUE-&gt;(RES)Main Hall]]</tw-passagedata><tw-passagedata pid="149" name="(RES)Main Hall" tags="" position="1877,3112" size="100,100">You have finally taken one treasure from each hall now time to find out how much money you&#39;ve made.
+
+[[TOTAL-&gt;TOTAL MONEY]]</tw-passagedata><tw-passagedata pid="150" name="TOTAL MONEY" tags="" position="1003,3589" size="100,100">Did you make enough to pay off the debt?</tw-passagedata></tw-storydata></div>
+        <script type='text/javascript'>document.getElementById('content').innerHTML = JSON.stringify(twineToJSON("harlowe-3"), null, 2);</script>
+	</body>
+</html>
